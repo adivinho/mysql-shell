@@ -1028,11 +1028,20 @@ class Dumper::Table_worker final {
   static std::string between(const std::string &column, T begin, T end) {
     assert(begin <= end);
 
+#if 0 // KH:
     if (begin == end) {
       return column + "=" + quote(begin);
     } else {
       return column + " BETWEEN " + quote(begin) + " AND " + quote(end);
     }
+#else
+    if (begin == end) {
+      return column + "= FROM_UNIXTIME(" + std::to_string(begin) + ")";
+    } else {
+      return column + " BETWEEN FROM_UNIXTIME(" + std::to_string(begin) + ") AND FROM_UNIXTIME(" + std::to_string(end) + ")";
+    }
+
+#endif
   }
 
   struct Chunking_info {
@@ -1361,11 +1370,16 @@ class Dumper::Table_worker final {
     } else if (mysqlshdk::db::Type::UInteger == type) {
       return chunk_integer_column(info, to_uint64_t(begin[info.index_column]),
                                   to_uint64_t(end[info.index_column]));
-    } else if (mysqlshdk::db::Type::Decimal == type) {
+    } else if (mysqlshdk::db::Type::DateTime == type) {
+      return chunk_integer_column(info, to_uint64_t(begin[info.index_column]),
+                                  to_uint64_t(end[info.index_column]));
+    }
+#if 0 // KH: template problem
+    else if (mysqlshdk::db::Type::Decimal == type) {
       return chunk_integer_column(info, Decimal{begin[info.index_column]},
                                   Decimal{end[info.index_column]});
     }
-
+#endif
     throw std::logic_error(
         "Unsupported column type for the integer algorithm: " +
         mysqlshdk::db::to_string(type));
@@ -1438,7 +1452,7 @@ class Dumper::Table_worker final {
     }
 
     const auto sql =
-        "SELECT SQL_NO_CACHE " + info.table->index.info->columns_sql() +
+        "SELECT SQL_NO_CACHE UNIX_TIMESTAMP("  + info.table->index.info->columns_sql() + ") AS " + info.table->index.info->columns_sql() +
         " FROM " + info.table->quoted_name + info.partition + where(info.where);
 
     auto result = query(sql + info.order_by + " LIMIT 1");
@@ -1481,7 +1495,10 @@ class Dumper::Table_worker final {
 
     if (mysqlshdk::db::Type::Integer == type ||
         mysqlshdk::db::Type::UInteger == type ||
-        mysqlshdk::db::Type::Decimal == type) {
+        mysqlshdk::db::Type::Decimal == type ||
+        mysqlshdk::db::Type::DateTime == type)
+         {
+// KH:      return chunk_non_integer_column(info, begin, end);
       return chunk_integer_column(info, begin, end);
     } else {
       return chunk_non_integer_column(info, begin, end);
@@ -1564,7 +1581,7 @@ class Dumper::Table_worker final {
           shcore::str_join(table.index.info->columns(), ",", [](const auto &c) {
             return c->quoted_name + " DESC";
           });
-      info.index_column = 0;
+      info.index_column = 0;   // KH: hardcodded column 0 of PK
     }
 
     log_info("%sChunking %s, rows: %" PRIu64 ", average row length: %" PRIu64
@@ -1572,7 +1589,7 @@ class Dumper::Table_worker final {
              m_log_id.c_str(), task_name.c_str(), info.row_count,
              average_row_length, info.rows_per_chunk);
 
-    const auto ranges_count = chunk_column(info);
+    const auto ranges_count = chunk_column(info);   // KH: here we start chunking by column 0
 
     duration.finish();
     log_debug("%sChunking of %s took %f seconds", m_log_id.c_str(),

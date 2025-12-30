@@ -35,6 +35,8 @@
 #include "mysqlshdk/libs/utils/ssl_keygen.h"
 #include "mysqlshdk/libs/utils/strformat.h"
 #include "mysqlshdk/libs/utils/utils_string.h"
+#include "mysqlshdk/libs/utils/utils_encoding.h"
+
 
 namespace mysqlshdk {
 namespace aws {
@@ -122,6 +124,11 @@ rest::Headers Aws_signer::sign_request(const rest::Signed_request *request,
                                  ? hex_sha256(request->body, request->size)
                                  : k_empty_payload_hash;
 
+#if 0
+  auto &md5 = result["Content-MD5"];
+  const auto hash = shcore::ssl::restricted::md5(request->body, request->size);
+  shcore::encode_base64(hash.data(), hash.size(), &md5);
+#endif
   // add required headers
   result[k_host_header] = m_host;
   result[k_date_header] = date;

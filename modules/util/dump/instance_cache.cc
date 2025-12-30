@@ -746,7 +746,8 @@ void Instance_cache_builder::fetch_table_indexes() {
       "SEQ_IN_INDEX"  // NOT NULL
   };
   info.table_name = "statistics";
-  info.where = "COLUMN_NAME IS NOT NULL AND NON_UNIQUE=0";
+// KH:  info.where = "COLUMN_NAME IS NOT NULL AND NON_UNIQUE=0";
+  info.where = "COLUMN_NAME IS NOT NULL";
 
   constexpr std::string_view k_primary_index = "PRIMARY";
   struct Index_info {

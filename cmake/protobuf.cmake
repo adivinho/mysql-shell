@@ -160,6 +160,19 @@ if (NOT ONLY_PROTOBUF_VERSION)
       ENDIF()
     ENDIF()
   ENDIF()
+  
+
+list(APPEND PROTOBUF_LIBRARIES
+    /usr/local/lib/libprotobuf.so
+    /usr/local/lib/libabsl_base.so
+    /usr/local/lib/libabsl_log_initialize.so
+    /usr/local/lib/libabsl_log_internal_globals.so
+    /usr/local/lib/libabsl_log_internal_message.so
+    /usr/local/lib/libabsl_log_internal_check_op.so
+    /usr/local/lib/libabsl_log_internal_format.so
+    /usr/local/lib/libabsl_log_internal_log_sink_set.so
+    /usr/local/lib/libabsl_log_internal_nullguard.so
+)
 
   MESSAGE("PROTOBUF_INCLUDE_DIRS: ${PROTOBUF_INCLUDE_DIRS}")
   MESSAGE("PROTOBUF_LIBRARIES: ${PROTOBUF_LIBRARIES}")

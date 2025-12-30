@@ -56,11 +56,12 @@ std::pair<const Instance_cache::Index *, bool> select_index(
     return filtered;
   };
 
+#if 0 // KH:
   if (table.primary_key && !filter_indexes({table.primary_key}).empty()) {
     // use primary key
     return {table.primary_key, true};
   }
-
+#endif
   const auto choose_index = [](const Indexes &indexes) {
     if (1 == indexes.size()) {
       return indexes.front();
