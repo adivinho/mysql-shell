@@ -124,7 +124,7 @@ rest::Headers Aws_signer::sign_request(const rest::Signed_request *request,
                                  ? hex_sha256(request->body, request->size)
                                  : k_empty_payload_hash;
 
-#if 0
+#if 0  // KH: AWS locked bucket header
   auto &md5 = result["Content-MD5"];
   const auto hash = shcore::ssl::restricted::md5(request->body, request->size);
   shcore::encode_base64(hash.data(), hash.size(), &md5);

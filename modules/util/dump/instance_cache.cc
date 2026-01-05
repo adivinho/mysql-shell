@@ -746,9 +746,11 @@ void Instance_cache_builder::fetch_table_indexes() {
       "SEQ_IN_INDEX"  // NOT NULL
   };
   info.table_name = "statistics";
-// KH:  info.where = "COLUMN_NAME IS NOT NULL AND NON_UNIQUE=0";
+#if 0
+  info.where = "COLUMN_NAME IS NOT NULL AND NON_UNIQUE=0";
+#else  // KH: use this part to allow chunking on non-unique index
   info.where = "COLUMN_NAME IS NOT NULL";
-
+#endif
   constexpr std::string_view k_primary_index = "PRIMARY";
   struct Index_info {
     std::vector<Instance_cache::Column *> columns;
@@ -798,6 +800,7 @@ void Instance_cache_builder::fetch_table_indexes() {
       auto &t = m_cache.schemas.at(schema.first).tables.at(table.first);
 
       for (const auto &index : table.second) {
+        log_info("KH: table: %s. Found index: %s", table.first.c_str(), index.first.c_str());
         Instance_cache::Index new_index;
         bool nullable = false;
 

@@ -56,7 +56,7 @@ std::pair<const Instance_cache::Index *, bool> select_index(
     return filtered;
   };
 
-#if 0 // KH:
+#if 1 // KH: remove this part to skip PK
   if (table.primary_key && !filter_indexes({table.primary_key}).empty()) {
     // use primary key
     return {table.primary_key, true};
@@ -64,6 +64,7 @@ std::pair<const Instance_cache::Index *, bool> select_index(
 #endif
   const auto choose_index = [](const Indexes &indexes) {
     if (1 == indexes.size()) {
+      log_info("KH: using index on columns %s for chunking", indexes[0]->columns_sql().c_str());
       return indexes.front();
     }
 

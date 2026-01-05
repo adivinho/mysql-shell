@@ -85,6 +85,7 @@ std::unordered_set<IDirectory::File_info> Directory::filter_files(
           (entry.path().filename().native());
 
       if (pattern.empty() || shcore::match_glob(pattern, name)) {
+        log_info("KH: found file: %s", name.c_str());
         files.emplace(std::move(name), [entry = std::move(entry)]() {
           return entry.file_size();
         });
@@ -96,6 +97,7 @@ std::unordered_set<IDirectory::File_info> Directory::filter_files(
     throw std::runtime_error(full_path().masked() + ": " + ec.message());
   }
 
+  log_info("KH: found files cnt: %lu", files.size());
   return files;
 }
 

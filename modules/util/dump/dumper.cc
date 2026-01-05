@@ -781,6 +781,7 @@ class Dumper::Table_worker final {
 
   inline std::shared_ptr<mysqlshdk::db::IResult> query(
       const std::string &sql) const {
+    //log_debug("KH: query: %s", sql.c_str());
     return Dumper::query(m_session, sql);
   }
 
@@ -1028,13 +1029,13 @@ class Dumper::Table_worker final {
   static std::string between(const std::string &column, T begin, T end) {
     assert(begin <= end);
 
-#if 0 // KH:
+#if 1
     if (begin == end) {
       return column + "=" + quote(begin);
     } else {
       return column + " BETWEEN " + quote(begin) + " AND " + quote(end);
     }
-#else
+#else // KH: TIMESTAMP PATCH
     if (begin == end) {
       return column + "= FROM_UNIXTIME(" + std::to_string(begin) + ")";
     } else {
@@ -1184,13 +1185,13 @@ class Dumper::Table_worker final {
   }
 
   template <typename T>
-  static T constant_step(const T & /* from */, const T &step) {
+  static T constant_step(const T & /* from */, const T &step, uint64_t *) {
     return step;
   }
 
   template <typename T>
   T adaptive_step(const T &from, const T &step, const T &max,
-                  const Chunking_info &info, const std::string &chunk_id) {
+                  const Chunking_info &info, const std::string &chunk_id, uint64_t *rows_cnt) {
     static constexpr int k_chunker_retries = 10;
     static constexpr int k_chunker_iterations = 20;
 
@@ -1213,7 +1214,13 @@ class Dumper::Table_worker final {
                              ->get_as_string(info.explain_rows_idx));
     };
 
-    while (delta > info.accuracy && retry < k_chunker_retries) {
+    int prev_delta_sign = 0;
+    bool threshold_crossed = false;
+    auto right_prev = from;
+    uint64_t rows_prev = 0;
+    auto left = from;
+    auto right = from;
+    while (true) {
       if (max - retry * double_step <= from) {
         // if left boundary is greater than max, stop here
         middle = max;
@@ -1222,47 +1229,78 @@ class Dumper::Table_worker final {
 
       // each time search in a different range, we didn't find the answer in the
       // previous one
+#if 0
       auto left = from + retry * double_step;
       auto right = sum(left, double_step);
-
-      assert(left < right);
+#else
+      right = sum(left, (retry+1) * step);
+//      log_debug("KH: iteration: %d searching range: %ld", retry, right-left);
+#endif
+    assert(left < right);
 
       for (int i = 0; i < k_chunker_iterations; ++i) {
-        middle = left + (right - left) / 2;
+        //auto middle_prev = middle;
+//        middle = left + (right - left) / 2;
 
-        if (middle >= right || middle <= left) {
-          break;
-        }
+//        if (middle >= right || middle <= left) {
+//          break;
+//        }
 
-        rows = row_count(from, middle);
+        rows = row_count(left, right);
+        log_debug("KH: iteration: %d searching range: %ld, (%ld, %ld), rows: %lu", retry, right-left, left, right, rows);
 
+#if 0
         if (0 == i && rows < info.rows_per_chunk) {
           // if in the first iteration there's not enough rows, check the whole
           // range, if there's still not enough rows we can skip this range
           const auto total_rows = row_count(from, right);
+          log_debug("KH: iteration: %d searching range: %ld, (%ld, %ld), rows: %lu", retry, right-from, from, right, total_rows);
 
           if (total_rows < info.rows_per_chunk) {
             middle = right;
             delta = info.rows_per_chunk - total_rows;
+            rows = total_rows;
             break;
           }
         }
-
+#endif
         if (rows > info.rows_per_chunk) {
-          right = middle;
+          threshold_crossed = prev_delta_sign < 0;
+          prev_delta_sign = 1;
           delta = rows - info.rows_per_chunk;
         } else {
-          left = middle;
+          threshold_crossed = prev_delta_sign > 0;
+          prev_delta_sign = -1;
           delta = info.rows_per_chunk - rows;
         }
-
         if (delta <= info.accuracy) {
           // we're close enough
           break;
         }
-      }
+        if (threshold_crossed) {
+          if (rows_prev > info.accuracy) {
+            right = right_prev;
+            rows = rows_prev;
+          }
+          retry = k_chunker_retries;
+          break;
+        }
 
-      if (delta > info.accuracy) {
+        rows_prev = rows;
+        right_prev = right;
+        if (rows > info.rows_per_chunk) {
+          right -= ensure_not_zero(step/k_chunker_retries);
+          if (right < left) {
+            right = right_prev;
+            break;
+          }
+        } else {
+          right += step;
+        }
+      }  // for
+
+
+      if (delta > info.accuracy && !threshold_crossed) {
         if (rows >= info.rows_per_chunk) {
           // we have too many rows, but that's OK...
           retry = k_chunker_retries;
@@ -1277,15 +1315,18 @@ class Dumper::Table_worker final {
           }
         }
       }
-    }
-
-    return ensure_not_zero(middle - from);
+      if (right < left || delta <= info.accuracy || retry >= k_chunker_retries) break;
+    }  // while
+    *rows_cnt = rows;
+    return ensure_not_zero(right - from);
   }
+
+  std::size_t ranges_count_g = 0;
 
   template <typename T>
   std::size_t chunk_integer_column(const Chunking_info &info, const T &min,
                                    const T &max) {
-    std::size_t ranges_count = 0;
+//    std::size_t ranges_count = 0;
 
     // if rows_per_chunk <= 1 it may mean that the rows are bigger than chunk
     // size, which means we # chunks ~= # rows
@@ -1310,17 +1351,17 @@ class Dumper::Table_worker final {
     std::string chunk_id;
     const auto next_step =
         use_constant_step
-            ? std::function<step_t(const step_t &, const step_t &)>(
+            ? std::function<step_t(const step_t &, const step_t &, uint64_t *)>(
                   constant_step<T>)
             // using the default capture [&] below results in problems with
             // GCC 5.4.0 (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80543)
             : [&info, &max, &chunk_id, this](const auto &from,
-                                             const auto &step) {
-                return this->adaptive_step(from, step, max, info, chunk_id);
+                                             const auto &step, uint64_t *rows_cnt) {
+                return this->adaptive_step(from, step, max, info, chunk_id, rows_cnt);
               };
 
     auto current = min;
-    const auto step = estimated_step;
+    auto step = estimated_step;
 
     log_info("%sChunking %s using integer algorithm with %s step",
              m_log_id.c_str(), info.table->task_name.c_str(),
@@ -1330,29 +1371,63 @@ class Dumper::Table_worker final {
 
     while (!last_chunk) {
       if (m_dumper->m_worker_interrupt) {
-        return ranges_count;
+        return ranges_count_g;
       }
 
-      chunk_id = std::to_string(ranges_count);
+      chunk_id = std::to_string(ranges_count_g);
       const auto begin = current;
-      auto new_step = next_step(current, step);
+      uint64_t rows_cnt = 0;
+      auto new_step = next_step(current, step, &rows_cnt);
+      log_debug("KH: current step: %lu, rows_cnt: %lu, new step: %lu", step, rows_cnt, new_step);
 
+      bool nested_chunk = false;
+      size_t idx_columns_cnt = info.table->index.info->columns().size();
+      if(new_step == 1 && info.index_column < idx_columns_cnt-1) {
+        if(rows_cnt > info.rows_per_chunk + info.accuracy) {
+          // we've got too much rows. Try to chunk using next column
+
+          Chunking_info new_info = info;
+          const auto row_count = [&new_info, this]() {
+            return to_uint64_t(query("EXPLAIN SELECT COUNT(*) FROM " +
+                                    new_info.table->quoted_name + new_info.partition +
+                                    where(new_info.where) +
+                                    new_info.order_by)
+                                  ->fetch_one_or_throw()
+                                  ->get_as_string(new_info.explain_rows_idx));
+          };
+
+          if (!new_info.where.empty()) {
+            new_info.where += " AND ";
+          }
+          new_info.where += info.table->index.info->columns()[info.index_column]->quoted_name + "=" + std::to_string(current);
+          new_info.index_column++;
+          new_info.row_count = row_count();
+          log_info("KH: too much rows (chunk by %ld), trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld",
+            new_info.index_column-1, new_info.index_column, new_info.row_count, new_info.rows_per_chunk);
+          chunk_column(new_info);
+          nested_chunk = true;
+        }
+      }
       // ensure that there's no integer overflow
       --new_step;
       current = (current > max - new_step ? max : current + new_step);
-
+      // step = new_step;
       const auto end = current;
 
       last_chunk = (current >= max);
 
+      ++current;
+      if (nested_chunk) {
+        log_info("KH: step processed by nested chunking. moving to the next chunk");
+        continue;
+      }
+
       create_and_push_table_data_chunk_task(*info.table,
                                             between(info, begin, end), chunk_id,
-                                            ranges_count++, last_chunk);
-
-      ++current;
+                                            ranges_count_g++, (last_chunk && info.index_column == 0));
     }
 
-    return ranges_count;
+    return ranges_count_g;
   }
 
   std::size_t chunk_integer_column(const Chunking_info &info, const Row &begin,
@@ -1370,14 +1445,16 @@ class Dumper::Table_worker final {
     } else if (mysqlshdk::db::Type::UInteger == type) {
       return chunk_integer_column(info, to_uint64_t(begin[info.index_column]),
                                   to_uint64_t(end[info.index_column]));
+#if 0
+    } else if (mysqlshdk::db::Type::Decimal == type) {
+      return chunk_integer_column(info, Decimal{begin[info.index_column]},
+                                  Decimal{end[info.index_column]});
+#endif
+    }
+#if 0 // KH: TIMESTAMP PATCH
     } else if (mysqlshdk::db::Type::DateTime == type) {
       return chunk_integer_column(info, to_uint64_t(begin[info.index_column]),
                                   to_uint64_t(end[info.index_column]));
-    }
-#if 0 // KH: template problem
-    else if (mysqlshdk::db::Type::Decimal == type) {
-      return chunk_integer_column(info, Decimal{begin[info.index_column]},
-                                  Decimal{end[info.index_column]});
     }
 #endif
     throw std::logic_error(
@@ -1450,11 +1527,15 @@ class Dumper::Table_worker final {
       // to return zero here
       return info.row_count / info.rows_per_chunk + 1;
     }
-
+#if 0  // KH: TIMESTAMP PATCH
     const auto sql =
         "SELECT SQL_NO_CACHE UNIX_TIMESTAMP("  + info.table->index.info->columns_sql() + ") AS " + info.table->index.info->columns_sql() +
         " FROM " + info.table->quoted_name + info.partition + where(info.where);
-
+#else
+    const auto sql =
+        "SELECT SQL_NO_CACHE " + info.table->index.info->columns_sql() +
+        " FROM " + info.table->quoted_name + info.partition + where(info.where);
+#endif
     auto result = query(sql + info.order_by + " LIMIT 1");
     auto row = result->fetch_one();
 
@@ -1493,11 +1574,18 @@ class Dumper::Table_worker final {
              shcore::str_join(begin, ", ").c_str(),
              shcore::str_join(end, ", ").c_str());
 
+#if 0  // KH: TIMESTAMP PATCH
     if (mysqlshdk::db::Type::Integer == type ||
-        mysqlshdk::db::Type::UInteger == type ||
-        mysqlshdk::db::Type::Decimal == type ||
-        mysqlshdk::db::Type::DateTime == type)
-         {
+      mysqlshdk::db::Type::UInteger == type ||
+      mysqlshdk::db::Type::Decimal == type ||
+      mysqlshdk::db::Type::DateTime == type)
+    {
+#else
+    if (mysqlshdk::db::Type::Integer == type ||
+      mysqlshdk::db::Type::UInteger == type ||
+      mysqlshdk::db::Type::Decimal == type)
+    {
+#endif
 // KH:      return chunk_non_integer_column(info, begin, end);
       return chunk_integer_column(info, begin, end);
     } else {
