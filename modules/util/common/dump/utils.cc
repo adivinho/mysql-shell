@@ -124,6 +124,8 @@ std::string get_table_data_filename(const std::string &basename,
 std::string get_table_data_filename(const std::string &basename,
                                     const std::string &ext, size_t index,
                                     bool last_chunk) {
+  //log_debug("KH: get_table_data_filename() id: %ld, last?: %d", index, last_chunk);
+
   return basename + k_separator + (last_chunk ? k_separator : "") +
          std::to_string(index) + "." + ext;
 }

@@ -780,8 +780,8 @@ class Dumper::Table_worker final {
   }
 
   inline std::shared_ptr<mysqlshdk::db::IResult> query(
-      const std::string &sql) const {
-    //log_debug("KH: query: %s", sql.c_str());
+      const std::string &sql, bool print=false) const {
+    if (print) log_debug("-> KH: query: %s", sql.c_str());
     return Dumper::query(m_session, sql);
   }
 
@@ -954,6 +954,7 @@ class Dumper::Table_worker final {
                                              const std::string &where,
                                              const std::string &id,
                                              std::size_t idx, bool last_chunk) {
+  //  log_debug("KH: create_and_push_table_data_chunk_task() id: %s (%ld), last?: %d, table: %s", id.c_str(), idx, last_chunk, table.name.c_str());
     Table_data_task data_task = create_table_data_task(
         table,
         m_dumper->get_table_data_filename(table.basename, idx, last_chunk));
@@ -975,6 +976,8 @@ class Dumper::Table_worker final {
         }
       }
     }
+
+    //log_info("KH: push dump taks with condition: %s", data_task.where.c_str());
 
     push_table_data_task(std::move(data_task));
   }
@@ -1185,12 +1188,12 @@ class Dumper::Table_worker final {
   }
 
   template <typename T>
-  static T constant_step(const T & /* from */, const T &step, uint64_t *) {
+  static T constant_step(const T & /* from */, const T &step, uint64_t *, bool) {
     return step;
   }
 
   template <typename T>
-  T adaptive_step(const T &from, const T &step, const T &max,
+  T adaptive_step_org(const T &from, const T &step, const T &max,
                   const Chunking_info &info, const std::string &chunk_id, uint64_t *rows_cnt) {
     static constexpr int k_chunker_retries = 10;
     static constexpr int k_chunker_iterations = 20;
@@ -1206,21 +1209,30 @@ class Dumper::Table_worker final {
 
     const auto row_count = [&info, &comment, this](const auto begin,
                                                    const auto end) {
+#if 1
+            auto q = query("EXPLAIN SELECT COUNT(*) FROM " +
+                               info.table->quoted_name + info.partition +
+                              " FORCE INDEX (PRIMARY) " +
+                               where(between(info, begin, end)) +
+                               info.order_by + comment);
+            auto row = q->fetch_one_or_throw();
+            uint64_t rows_res = to_uint64_t(row->get_as_string(info.explain_rows_idx));
+            double percent = std::stod(row->get_as_string(info.explain_rows_idx+1));
+            uint64_t real_rows_cnt = rows_res * (percent/100);
+            log_info("KH: adaptive_step estimating rows cnt. rows: %ld, percent: %f, real_rows_cnt: %ld",
+              rows_res, percent, real_rows_cnt);
+            return real_rows_cnt;
+#else
       return to_uint64_t(query("EXPLAIN SELECT COUNT(*) FROM " +
                                info.table->quoted_name + info.partition +
                                where(between(info, begin, end)) +
                                info.order_by + comment)
                              ->fetch_one_or_throw()
                              ->get_as_string(info.explain_rows_idx));
+#endif
     };
 
-    int prev_delta_sign = 0;
-    bool threshold_crossed = false;
-    auto right_prev = from;
-    uint64_t rows_prev = 0;
-    auto left = from;
-    auto right = from;
-    while (true) {
+    while (delta > info.accuracy && retry < k_chunker_retries) {
       if (max - retry * double_step <= from) {
         // if left boundary is greater than max, stop here
         middle = max;
@@ -1229,78 +1241,47 @@ class Dumper::Table_worker final {
 
       // each time search in a different range, we didn't find the answer in the
       // previous one
-#if 0
       auto left = from + retry * double_step;
       auto right = sum(left, double_step);
-#else
-      right = sum(left, (retry+1) * step);
-//      log_debug("KH: iteration: %d searching range: %ld", retry, right-left);
-#endif
-    assert(left < right);
+
+      assert(left < right);
 
       for (int i = 0; i < k_chunker_iterations; ++i) {
-        //auto middle_prev = middle;
-//        middle = left + (right - left) / 2;
+        middle = left + (right - left) / 2;
 
-//        if (middle >= right || middle <= left) {
-//          break;
-//        }
+        if (middle >= right || middle <= left) {
+          break;
+        }
 
-        rows = row_count(left, right);
-        log_debug("KH: iteration: %d searching range: %ld, (%ld, %ld), rows: %lu", retry, right-left, left, right, rows);
+        rows = row_count(from, middle);
 
-#if 0
         if (0 == i && rows < info.rows_per_chunk) {
           // if in the first iteration there's not enough rows, check the whole
           // range, if there's still not enough rows we can skip this range
           const auto total_rows = row_count(from, right);
-          log_debug("KH: iteration: %d searching range: %ld, (%ld, %ld), rows: %lu", retry, right-from, from, right, total_rows);
 
           if (total_rows < info.rows_per_chunk) {
             middle = right;
             delta = info.rows_per_chunk - total_rows;
-            rows = total_rows;
             break;
           }
         }
-#endif
+
         if (rows > info.rows_per_chunk) {
-          threshold_crossed = prev_delta_sign < 0;
-          prev_delta_sign = 1;
+          right = middle;
           delta = rows - info.rows_per_chunk;
         } else {
-          threshold_crossed = prev_delta_sign > 0;
-          prev_delta_sign = -1;
+          left = middle;
           delta = info.rows_per_chunk - rows;
         }
+
         if (delta <= info.accuracy) {
           // we're close enough
           break;
         }
-        if (threshold_crossed) {
-          if (rows_prev > info.accuracy) {
-            right = right_prev;
-            rows = rows_prev;
-          }
-          retry = k_chunker_retries;
-          break;
-        }
+      }
 
-        rows_prev = rows;
-        right_prev = right;
-        if (rows > info.rows_per_chunk) {
-          right -= ensure_not_zero(step/k_chunker_retries);
-          if (right < left) {
-            right = right_prev;
-            break;
-          }
-        } else {
-          right += step;
-        }
-      }  // for
-
-
-      if (delta > info.accuracy && !threshold_crossed) {
+      if (delta > info.accuracy) {
         if (rows >= info.rows_per_chunk) {
           // we have too many rows, but that's OK...
           retry = k_chunker_retries;
@@ -1315,9 +1296,241 @@ class Dumper::Table_worker final {
           }
         }
       }
+    }
+    *rows_cnt = rows;
+    return ensure_not_zero(middle - from);
+  }
+
+
+
+
+
+#define KH_DBG_STEP(x) x
+#define KH_DBG(x) x
+  template <typename T>
+  T adaptive_step(const T &from, const T &step_hint, const T &/*max*/,
+                  const Chunking_info &info, const std::string &chunk_id, uint64_t *rows_cnt, bool *use_returned_cnt) {
+    static constexpr int k_chunker_retries = 10;
+    static constexpr int k_chunker_iterations = 21;
+
+//    const auto double_step = 2 * step_hint;
+    //auto middle = from;
+
+    auto rows = info.rows_per_chunk;
+    const auto comment = this->get_query_comment(*info.table, chunk_id);
+
+    int retry = 0;
+    uint64_t delta = info.accuracy + 1;
+
+    const auto row_count = [&info, &comment, this](const auto begin,
+                                                   const auto end) {
+#if 1
+            auto q  = query("EXPLAIN SELECT COUNT(*) FROM " +
+                               info.table->quoted_name + info.partition +
+                               " FORCE INDEX (PRIMARY) " +
+                               where(between(info, begin, end)) +
+                               info.order_by + comment);
+            auto row = q->fetch_one_or_throw();
+            uint64_t rows_res = to_uint64_t(row->get_as_string(info.explain_rows_idx));
+            double percent = std::stod(row->get_as_string(info.explain_rows_idx+1));
+            uint64_t real_rows_cnt = rows_res * (percent/100);
+//            KH_DBG_STEP(log_info("KH: adaptive_step estimating rows cnt. rows: %ld, percent: %f, real_rows_cnt: %ld",
+//              rows_res, percent, real_rows_cnt);)
+            return real_rows_cnt;
+
+#else
+      return to_uint64_t(query("SELECT COUNT(*) FROM " +
+                               info.table->quoted_name + info.partition +
+                               where(between(info, begin, end)) +
+                               info.order_by + comment)
+                             ->fetch_one_or_throw()
+                             ->get_as_string(0));
+#endif
+    };
+
+    uint64_t delta_prev = (uint64_t)-1;
+    int prev_delta_sign = 0;
+    bool threshold_crossed = false;
+    auto right_prev = from;
+    uint64_t rows_prev = 0;
+    auto left = from;
+    auto right = from;
+
+    *use_returned_cnt = false;
+    while (true) {
+#if 0
+      if (max - retry * double_step <= from) {
+        // if left boundary is greater than max, stop here
+//        middle = max;
+        break;
+      }
+#endif
+      // each time search in a different range, we didn't find the answer in the
+      // previous one
+#if 0
+      auto left = from + retry * double_step;
+      auto right = sum(left, double_step);
+#else
+//      T step = step_hint > (k_chunker_iterations) ? (step_hint / (k_chunker_iterations)) * (k_chunker_iterations) : step_hint;
+      right = sum(left, (retry+1) * step_hint);
+      KH_DBG_STEP(log_debug("KH: retry: %d searching range: %ld - %ld (%ld), step_hint: %ld",
+        retry, left, right, right-left, step_hint);)
+#endif
+//      assert(left < right);
+
+    // check the full range first
+    rows = row_count(left, right);
+    if (rows < info.rows_per_chunk) {
+      KH_DBG_STEP(log_debug("    KH: full range %ld - %ld contains %ld rows. Skipping.", left, right, rows);)
+      if (retry >= k_chunker_retries) break;
+      retry++;
+      continue;
+    }
+
+    for (int i = 0; i < k_chunker_iterations; ++i) {
+        //auto middle_prev = middle;
+//        middle = left + (right - left) / 2;
+
+//        if (middle >= right || middle <= left) {
+//          break;
+//        }
+
+        rows = row_count(left, right);
+//        KH_DBG_STEP(log_debug("    KH: iteration: %d range: %ld - %ld (%ld), rows: %lu, acc: %ld",
+//          i, left, right, right-left, rows, info.accuracy);)
+
+        if (rows > info.rows_per_chunk) {
+          threshold_crossed = prev_delta_sign < 0;
+          prev_delta_sign = 1;
+          delta = rows - info.rows_per_chunk;
+//          KH_DBG_STEP(log_debug("        KH: > rows: %ld, rows_per_chunk: %ld, threshold_crossed: %d, delta: %ld", rows, info.rows_per_chunk, threshold_crossed, delta);)
+        } else {
+          threshold_crossed = prev_delta_sign > 0;
+          prev_delta_sign = -1;
+          delta = info.rows_per_chunk - rows;
+//          KH_DBG_STEP(log_debug("        KH: <= rows: %ld, rows_per_chunk: %ld, threshold_crossed: %d, delta: %ld", rows, info.rows_per_chunk, threshold_crossed, delta);)
+        }
+        if (delta <= info.accuracy) {
+          KH_DBG_STEP(log_debug("        KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+          // we're close enough
+#if 0
+          if (delta > delta_prev) {
+            // previous one was closer to expected rows count
+            KH_DBG_STEP(log_debug("        KH: previous delta was closer");)
+            right = right_prev;
+            rows = rows_prev;
+            KH_DBG_STEP(log_debug("            KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+          }
+#endif
+          break;
+        }
+        if (threshold_crossed) {
+          if (delta > delta_prev  || rows < info.rows_per_chunk / 2) { // at most half chunk
+            // previous one was closer to expected rows count
+            KH_DBG_STEP(log_debug("        KH: glue to previous one");)
+            right = right_prev;
+            rows = rows_prev;
+          }
+          retry = k_chunker_retries;
+          *use_returned_cnt = true;
+          KH_DBG_STEP(log_debug("        KH: threshold crossed. using: rows: %ld", rows);)
+          break;
+        }
+
+        rows_prev = rows;
+        right_prev = right;
+        delta_prev = delta;
+        if (rows > info.rows_per_chunk) {
+          if (i < k_chunker_iterations-1){ // we are not bailing out yet
+            right -= ensure_not_zero(step_hint/k_chunker_iterations);
+          }
+          if (right < left) {
+            right = right_prev;
+            break;
+          }
+        } else {
+          right += step_hint/k_chunker_iterations;
+        }
+      }  // for
+
+
+      if (delta > info.accuracy && !threshold_crossed) {
+        if (rows >= info.rows_per_chunk) {
+          // we have too many rows, but that's OK...
+          KH_DBG_STEP(log_debug("        KH: too many rows after chunker iterations. Giving up.");)
+          retry = k_chunker_retries;
+        } else {
+          // we didn't find enough rows here, move farther to
+          // the right
+          ++retry;
+        }
+      }
       if (right < left || delta <= info.accuracy || retry >= k_chunker_retries) break;
     }  // while
+
+#if 1
+    if (rows > 2*info.rows_per_chunk + info.accuracy) {
+      // we have too much rows. There is still a chance to chunk the last range. Do it by halving.
+      KH_DBG_STEP(log_debug("        KH: Trying to chop the last range");)
+      rows_prev = rows;
+      right_prev = right;
+      delta_prev = delta;
+      threshold_crossed = false;
+      prev_delta_sign = rows > info.rows_per_chunk ? 1 : -1;
+      while (1) {
+        T range = ensure_not_zero(right - from);
+        if (range == 1) {
+          log_debug("        KH: reached range 1, rows: %ld", rows);
+          break;
+        }
+        right = from + range / 2;
+        rows = row_count(from, right);
+
+        if (rows > info.rows_per_chunk) {
+          threshold_crossed = prev_delta_sign < 0;
+          prev_delta_sign = 1;
+          delta = rows - info.rows_per_chunk;
+          KH_DBG_STEP(log_debug("        KH: > rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+        } else {
+          threshold_crossed = prev_delta_sign > 0;
+          prev_delta_sign = -1;
+          delta = info.rows_per_chunk - rows;
+          KH_DBG_STEP(log_debug("        KH: <= rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+        }
+        if (threshold_crossed) {
+          KH_DBG_STEP(log_debug("        KH: delta: %ld, delta_prev: %ld, 2*rpc: %ld", delta, delta_prev, 2*info.rows_per_chunk);)
+          if ((delta > delta_prev) || (rows_prev < info.rows_per_chunk * 2)) {
+            // glue to the previous one, will be at most two times big
+            KH_DBG_STEP(log_debug("        KH: glue to previous one");)
+            right = right_prev;
+            rows = rows_prev;
+          }
+          retry = k_chunker_retries;
+          *use_returned_cnt = true;
+          KH_DBG_STEP(log_debug("        KH: threshold crossed. using: rows: %ld", rows);)
+          break;
+        }
+
+        if (delta <= info.accuracy) {
+          KH_DBG_STEP(log_debug("        KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+          // we're close enough but maybe previous delta was better
+          if (delta > delta_prev) {
+            // previous one was closer to expected rows count
+            KH_DBG_STEP(log_debug("        KH: previous delta was closer");)
+            right = right_prev;
+            rows = rows_prev;
+            KH_DBG_STEP(log_debug("            KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+          }
+          break;
+        }
+        rows_prev = rows;
+        right_prev = right;
+        delta_prev = delta;
+      }
+    }
+#endif
     *rows_cnt = rows;
+    KH_DBG_STEP(log_debug("    KH: adaptive_step() returning %ld rows (left: %ld, right: %ld, ret: %ld)", rows, from, right, ensure_not_zero(right - from));)
     return ensure_not_zero(right - from);
   }
 
@@ -1348,28 +1561,35 @@ class Dumper::Table_worker final {
              ? index_range - info.row_count
              : info.row_count - index_range) <= row_count_accuracy;
 
+    KH_DBG(log_debug("KH: nest_level: %ld, chunk_integer_column(). min: %ld, max: %ld, row_count: %ld, estimated_chunks: %ld, estimated_step: %ld, constant?: %d",
+      info.index_column, min, max, info.row_count, estimated_chunks, estimated_step, use_constant_step);)
+
     std::string chunk_id;
     const auto next_step =
         use_constant_step
-            ? std::function<step_t(const step_t &, const step_t &, uint64_t *)>(
+            ? std::function<step_t(const step_t &, const step_t &, uint64_t *, bool*)>(
                   constant_step<T>)
             // using the default capture [&] below results in problems with
             // GCC 5.4.0 (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80543)
             : [&info, &max, &chunk_id, this](const auto &from,
-                                             const auto &step, uint64_t *rows_cnt) {
-                return this->adaptive_step(from, step, max, info, chunk_id, rows_cnt);
+                                             const auto &step, uint64_t *rows_cnt, bool *use_returned_cnt) {
+                return this->adaptive_step(from, step, max, info, chunk_id, rows_cnt, use_returned_cnt);
               };
 
     auto current = min;
     auto step = estimated_step;
 
-    log_info("%sChunking %s using integer algorithm with %s step",
+    log_info("%sChunking %s using integer algorithm with %s step. step: %ld",
              m_log_id.c_str(), info.table->task_name.c_str(),
-             use_constant_step ? "constant" : "adaptive");
+             use_constant_step ? "constant" : "adaptive", step);
+
+    KH_DBG(log_debug("KH: nest_level: %ld, trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld, index columns cnt: %ld",
+        info.index_column, info.index_column, info.row_count, info.rows_per_chunk, info.table->index.info->columns().size());)
 
     bool last_chunk = false;
+    bool last_chunk_on_this_level=false;
 
-    while (!last_chunk) {
+    while (!last_chunk && !last_chunk_on_this_level) {
       if (m_dumper->m_worker_interrupt) {
         return ranges_count_g;
       }
@@ -1377,8 +1597,9 @@ class Dumper::Table_worker final {
       chunk_id = std::to_string(ranges_count_g);
       const auto begin = current;
       uint64_t rows_cnt = 0;
-      auto new_step = next_step(current, step, &rows_cnt);
-      log_debug("KH: current step: %lu, rows_cnt: %lu, new step: %lu", step, rows_cnt, new_step);
+      bool use_returned_cnt = false;
+      auto new_step = next_step(current, step, &rows_cnt, &use_returned_cnt);
+//      log_debug("KH: current step: %lu, rows_cnt: %lu, new step: %lu", step, rows_cnt, new_step);
 
       bool nested_chunk = false;
       size_t idx_columns_cnt = info.table->index.info->columns().size();
@@ -1387,44 +1608,94 @@ class Dumper::Table_worker final {
           // we've got too much rows. Try to chunk using next column
 
           Chunking_info new_info = info;
+#if 0
           const auto row_count = [&new_info, this]() {
+#if 1
+            auto q = query("EXPLAIN SELECT COUNT(*) FROM " +
+                                    new_info.table->quoted_name + new_info.partition +
+                                    " FORCE INDEX (PRIMARY) " +
+                                    where(new_info.where) +
+                                    new_info.order_by);
+            auto row = q->fetch_one_or_throw();
+            uint64_t rows_res = to_uint64_t(row->get_as_string(new_info.explain_rows_idx));
+            double percent = std::stod(row->get_as_string(new_info.explain_rows_idx+1));
+            uint64_t real_rows_cnt = rows_res * (percent/100);
+            //log_info("KH: estimating rows for next level scan. rows: %ld, percent: %f, real_rows_cnt: %ld",
+//              rows_res, percent, real_rows_cnt);
+            return real_rows_cnt;
+#else
             return to_uint64_t(query("EXPLAIN SELECT COUNT(*) FROM " +
                                     new_info.table->quoted_name + new_info.partition +
                                     where(new_info.where) +
                                     new_info.order_by)
                                   ->fetch_one_or_throw()
                                   ->get_as_string(new_info.explain_rows_idx));
+#endif
           };
+#endif
 
+#if 1
           if (!new_info.where.empty()) {
             new_info.where += " AND ";
           }
           new_info.where += info.table->index.info->columns()[info.index_column]->quoted_name + "=" + std::to_string(current);
+#else
+          new_info.where = between(new_info, current, current + new_step);
+#endif
           new_info.index_column++;
-          new_info.row_count = row_count();
-          log_info("KH: too much rows (chunk by %ld), trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld",
-            new_info.index_column-1, new_info.index_column, new_info.row_count, new_info.rows_per_chunk);
+          new_info.row_count = rows_cnt; //row_count();
+          log_debug("KH: nest_level: %ld, too much rows (tried chunk by %ld), trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld, rows_cnt (from previous): %ld, new_step: %ld",
+             info.index_column, new_info.index_column-1, new_info.index_column, new_info.row_count, new_info.rows_per_chunk, rows_cnt, new_step);
           chunk_column(new_info);
           nested_chunk = true;
         }
       }
       // ensure that there's no integer overflow
       --new_step;
-      current = (current > max - new_step ? max : current + new_step);
-      // step = new_step;
-      const auto end = current;
+      auto this_chunk_end = (current > max - new_step ? max : current + new_step);
+      const auto end = this_chunk_end;
 
-      last_chunk = (current >= max);
+      last_chunk = (this_chunk_end >= max) && info.index_column == 0;
 
+      if (!use_constant_step) {
+        if(!use_returned_cnt && rows_cnt < info.rows_per_chunk) {
+          if (this_chunk_end >= max) {
+            KH_DBG(log_info("KH: nest_level: %ld, End of range. Range didn't contain enough rows (%ld). No more rows in range.",  info.index_column, rows_cnt);)
+            // nothing to extend. If it is processing of the nested chunk - bail out
+            if (!last_chunk) {
+              KH_DBG(log_info("KH: nest_level: %ld, This was nested chunk. Need to dump it as it is",  info.index_column);)
+              last_chunk_on_this_level = true;
+            }
+          } else {
+            KH_DBG(log_info("KH: nest_level: %ld, range didn't contain enough rows (%ld). Extending range.",  info.index_column, rows_cnt);)
+            step += step;
+            continue;
+          }
+        }
+      } else {
+        KH_DBG(log_info("KH: nest_level: %ld, constant step chunk", info.index_column);)
+      }
+
+      if (this_chunk_end >= max) {
+        KH_DBG(log_info("KH: nest_level: %ld, End of range. rows (%ld). No more rows in range.",  info.index_column, rows_cnt);)
+        if (!last_chunk) {
+          KH_DBG(log_info("KH: nest_level: %ld, This was nested chunk. Need to dump it as it is",  info.index_column);)
+          last_chunk_on_this_level = true;
+        }
+      }
+      current = this_chunk_end;
       ++current;
       if (nested_chunk) {
-        log_info("KH: step processed by nested chunking. moving to the next chunk");
+        //log_info("KH: step processed by nested chunking. moving to the next chunk");
         continue;
       }
 
+      log_info("KH: nest_level: %ld, creating dump task for chunk: %s, rows_cnt: %ld (rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld",
+         info.index_column , chunk_id.c_str(), rows_cnt, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column);
+
       create_and_push_table_data_chunk_task(*info.table,
                                             between(info, begin, end), chunk_id,
-                                            ranges_count_g++, (last_chunk && info.index_column == 0));
+                                            ranges_count_g++, (last_chunk));
     }
 
     return ranges_count_g;
@@ -1540,12 +1811,13 @@ class Dumper::Table_worker final {
     auto row = result->fetch_one();
 
     const auto handle_empty_table = [&info, this]() {
-      create_and_push_table_data_chunk_task(*info.table, info.where, "0", 0,
-                                            true);
+//      create_and_push_table_data_chunk_task(*info.table, info.where, "0", 0,
+//                                            true);
       return 1;
     };
 
     if (!row) {
+      //log_debug("KH: empty table row 1");
       return handle_empty_table();
     }
 
@@ -1555,6 +1827,7 @@ class Dumper::Table_worker final {
     row = result->fetch_one();
 
     if (!row) {
+      //log_debug("KH: empty table row 2");
       return handle_empty_table();
     }
 
