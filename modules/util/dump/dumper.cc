@@ -1302,11 +1302,102 @@ class Dumper::Table_worker final {
   }
 
 
-
-
-
 #define KH_DBG_STEP(x) x
 #define KH_DBG(x) x
+#define KH_DBG_GLUE(x) x
+
+template <class T>
+class Gluer {
+  public:
+    struct GlueResult {
+      T begin;
+      T end;
+      uint64_t rows_cnt;
+
+      GlueResult(T b, T e, uint64_t r) : begin(b), end(e), rows_cnt(r) {}
+    };
+
+    Gluer(uint64_t max_rows_cnt)
+      : begin_(0)
+      , end_(0)
+      , rows_cnt_(0)
+      , max_rows_cnt_(max_rows_cnt)
+      , zero_result(0, 0, 0) {}
+
+    GlueResult flush() {
+        KH_DBG_GLUE(log_debug("KH: flush() (%ld - %ld) rows: %ld", begin_, end_, rows_cnt_);)
+        GlueResult res(begin_, end_, rows_cnt_);
+        begin_ = end_ = 0;
+        rows_cnt_ = 0;
+        return res;
+    }
+
+    GlueResult glue(T begin, T end,  uint64_t rows_cnt, bool last) {
+      KH_DBG_GLUE(log_debug("KH: glue() %ld - %ld, rows: %ld, last?: %d (current: %ld - %ld, %ld)",
+        begin, end, rows_cnt, last, begin_, end_, rows_cnt_);)
+      if (rows_cnt_ == 0) {
+        // whatever is the chunk, wait for the next one to decide
+        KH_DBG_GLUE(log_debug("KH: glue() - new glue");)
+        begin_ = begin;
+        end_ = end;
+        rows_cnt_ += rows_cnt;
+      } else {
+        // we have some rows accumulated
+        if (rows_cnt_ > max_rows_cnt_) {
+          // we are ready to flush, just wait for good conditions
+          if (rows_cnt > max_rows_cnt_/2) {
+            // if the upcoming chunk is a good candidate to start new glue,
+            // return the current glue and remember this chunk
+            KH_DBG_GLUE(log_debug("KH: glue() - return current, start new");)
+            GlueResult res(begin_, end_, rows_cnt_);
+            begin_ = begin;
+            end_ = end;
+            rows_cnt_ = rows_cnt;
+            return res;
+          } else {
+            // glue it
+            KH_DBG_GLUE(log_debug("KH: glue() - glue 1");)
+            end_ = end;
+            rows_cnt_ += rows_cnt;
+          }
+        } else {
+          // we didn't accumulate enough rows yet
+          // glue it
+          KH_DBG_GLUE(log_debug("KH: glue() - glue 2");)
+          end_ = end;
+          rows_cnt_ += rows_cnt;
+        }
+
+        if (rows_cnt_ > 3*max_rows_cnt_ || last){
+          // flush gluer if we accumulated a lot of chunks or this is the last
+          // one
+          KH_DBG_GLUE(log_debug("KH: glue() - flushing gluer 1. rows: %ld, last?: %d", rows_cnt_, last);)
+          return flush();
+        }
+      }
+
+      if (last){
+        // flush last chunk
+        KH_DBG_GLUE(log_debug("KH: glue() - flushing gluer 2. rows: %ld, last?: %d", rows_cnt_, last);)
+        GlueResult res(begin_, end_, rows_cnt_);
+        begin_ = end_ = 0;
+        rows_cnt_ = 0;
+        return res;
+      }
+
+      // accumulated
+      KH_DBG_GLUE(log_debug("KH: glue() - accumulated %ld - %ld, rows: %ld", begin_, end_, rows_cnt_);)
+      return zero_result;
+    }
+
+  private:
+    T begin_;
+    T end_;
+    uint64_t rows_cnt_;
+    uint64_t max_rows_cnt_;
+    GlueResult zero_result;
+};
+
   template <typename T>
   T adaptive_step(const T &from, const T &step_hint, const T &/*max*/,
                   const Chunking_info &info, const std::string &chunk_id, uint64_t *rows_cnt, bool *use_returned_cnt) {
@@ -1334,8 +1425,8 @@ class Dumper::Table_worker final {
             uint64_t rows_res = to_uint64_t(row->get_as_string(info.explain_rows_idx));
             double percent = std::stod(row->get_as_string(info.explain_rows_idx+1));
             uint64_t real_rows_cnt = rows_res * (percent/100);
-//            KH_DBG_STEP(log_info("KH: adaptive_step estimating rows cnt. rows: %ld, percent: %f, real_rows_cnt: %ld",
-//              rows_res, percent, real_rows_cnt);)
+            KH_DBG_STEP(log_info("KH: (%ld) adaptive_step estimating rows cnt. rows: %ld, percent: %f, real_rows_cnt: %ld",
+              info.index_column, rows_res, percent, real_rows_cnt);)
             return real_rows_cnt;
 
 #else
@@ -1373,15 +1464,15 @@ class Dumper::Table_worker final {
 #else
 //      T step = step_hint > (k_chunker_iterations) ? (step_hint / (k_chunker_iterations)) * (k_chunker_iterations) : step_hint;
       right = sum(left, (retry+1) * step_hint);
-      KH_DBG_STEP(log_debug("KH: retry: %d searching range: %ld - %ld (%ld), step_hint: %ld",
-        retry, left, right, right-left, step_hint);)
+      KH_DBG_STEP(log_debug("KH: (%ld) retry: %d searching range: %ld - %ld (%ld), step_hint: %ld",
+        info.index_column, retry, left, right, right-left, step_hint);)
 #endif
 //      assert(left < right);
 
     // check the full range first
     rows = row_count(left, right);
     if (rows < info.rows_per_chunk) {
-      KH_DBG_STEP(log_debug("    KH: full range %ld - %ld contains %ld rows. Skipping.", left, right, rows);)
+      KH_DBG_STEP(log_debug("    KH: (%ld) full range %ld - %ld contains %ld rows. Skipping.", info.index_column,left, right, rows);)
       if (retry >= k_chunker_retries) break;
       retry++;
       continue;
@@ -1411,7 +1502,7 @@ class Dumper::Table_worker final {
 //          KH_DBG_STEP(log_debug("        KH: <= rows: %ld, rows_per_chunk: %ld, threshold_crossed: %d, delta: %ld", rows, info.rows_per_chunk, threshold_crossed, delta);)
         }
         if (delta <= info.accuracy) {
-          KH_DBG_STEP(log_debug("        KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
+          KH_DBG_STEP(log_debug("        KH: (%ld) close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", info.index_column, rows, info.rows_per_chunk, delta);)
           // we're close enough
 #if 0
           if (delta > delta_prev) {
@@ -1427,13 +1518,13 @@ class Dumper::Table_worker final {
         if (threshold_crossed) {
           if (delta > delta_prev  || rows < info.rows_per_chunk / 2) { // at most half chunk
             // previous one was closer to expected rows count
-            KH_DBG_STEP(log_debug("        KH: glue to previous one");)
+            KH_DBG_STEP(log_debug("        KH: (%ld) glue to previous one", info.index_column);)
             right = right_prev;
             rows = rows_prev;
           }
           retry = k_chunker_retries;
           *use_returned_cnt = true;
-          KH_DBG_STEP(log_debug("        KH: threshold crossed. using: rows: %ld", rows);)
+          KH_DBG_STEP(log_debug("        KH: (%ld) threshold crossed. using: rows: %ld", info.index_column, rows);)
           break;
         }
 
@@ -1457,7 +1548,7 @@ class Dumper::Table_worker final {
       if (delta > info.accuracy && !threshold_crossed) {
         if (rows >= info.rows_per_chunk) {
           // we have too many rows, but that's OK...
-          KH_DBG_STEP(log_debug("        KH: too many rows after chunker iterations. Giving up.");)
+          KH_DBG_STEP(log_debug("        KH: (%ld) too many rows after chunker iterations. Giving up.", info.index_column);)
           retry = k_chunker_retries;
         } else {
           // we didn't find enough rows here, move farther to
@@ -1469,68 +1560,48 @@ class Dumper::Table_worker final {
     }  // while
 
 #if 1
-    if (rows > 2*info.rows_per_chunk + info.accuracy) {
+    if (rows > info.rows_per_chunk + info.accuracy) {
       // we have too much rows. There is still a chance to chunk the last range. Do it by halving.
-      KH_DBG_STEP(log_debug("        KH: Trying to chop the last range");)
-      rows_prev = rows;
-      right_prev = right;
-      delta_prev = delta;
-      threshold_crossed = false;
-      prev_delta_sign = rows > info.rows_per_chunk ? 1 : -1;
+      KH_DBG_STEP(log_debug("        KH: (%ld) Rows: %ld Trying to chop the last range: %ld - %ld", info.index_column, rows, from, right);)
+
+      left = from;
+      right = from + (right-left) / 2;
       while (1) {
-        T range = ensure_not_zero(right - from);
-        if (range == 1) {
-          log_debug("        KH: reached range 1, rows: %ld", rows);
-          break;
-        }
-        right = from + range / 2;
+        KH_DBG_STEP(log_debug("        KH: (%ld) checking range: %ld - %ld (left: %ld)", info.index_column, from, right, left);)
         rows = row_count(from, right);
 
-        if (rows > info.rows_per_chunk) {
-          threshold_crossed = prev_delta_sign < 0;
-          prev_delta_sign = 1;
-          delta = rows - info.rows_per_chunk;
-          KH_DBG_STEP(log_debug("        KH: > rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
-        } else {
-          threshold_crossed = prev_delta_sign > 0;
-          prev_delta_sign = -1;
-          delta = info.rows_per_chunk - rows;
-          KH_DBG_STEP(log_debug("        KH: <= rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
-        }
-        if (threshold_crossed) {
-          KH_DBG_STEP(log_debug("        KH: delta: %ld, delta_prev: %ld, 2*rpc: %ld", delta, delta_prev, 2*info.rows_per_chunk);)
-          if ((delta > delta_prev) || (rows_prev < info.rows_per_chunk * 2)) {
-            // glue to the previous one, will be at most two times big
-            KH_DBG_STEP(log_debug("        KH: glue to previous one");)
-            right = right_prev;
-            rows = rows_prev;
-          }
-          retry = k_chunker_retries;
+        delta = rows > info.rows_per_chunk ? rows - info.rows_per_chunk : info.rows_per_chunk - rows;
+        if (delta <= info.accuracy) {
+          KH_DBG_STEP(log_debug("        KH: (%ld) close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld, range: %ld - %ld", info.index_column, rows, info.rows_per_chunk, delta, from, right);)
           *use_returned_cnt = true;
-          KH_DBG_STEP(log_debug("        KH: threshold crossed. using: rows: %ld", rows);)
           break;
         }
 
-        if (delta <= info.accuracy) {
-          KH_DBG_STEP(log_debug("        KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
-          // we're close enough but maybe previous delta was better
-          if (delta > delta_prev) {
-            // previous one was closer to expected rows count
-            KH_DBG_STEP(log_debug("        KH: previous delta was closer");)
-            right = right_prev;
-            rows = rows_prev;
-            KH_DBG_STEP(log_debug("            KH: close enough: rows: %ld, rows_per_chunk: %ld, delta: %ld", rows, info.rows_per_chunk, delta);)
-          }
+        if (right == from) {
+          log_debug("        KH: (%ld) reached range 1, rows: %ld, range: %ld - %ld", info.index_column, rows, from, right);
           break;
         }
-        rows_prev = rows;
-        right_prev = right;
-        delta_prev = delta;
+
+        if (left >= right) {
+          KH_DBG_STEP(log_debug("        KH: (%ld) No way to chop it more. Will use the current estimate. rows: %ld, rows_per_chunk: %ld, delta: %ld, range: %ld - %ld", info.index_column, rows, info.rows_per_chunk, delta, from, right);)
+          *use_returned_cnt = true;
+          break;
+        }
+
+        if (rows > info.rows_per_chunk) {
+          KH_DBG_STEP(log_debug("        KH: (%ld) (shrink) > rows: %ld, rows_per_chunk: %ld, range: %ld - %ld", info.index_column, rows, info.rows_per_chunk, from, right);)
+          right = right - ensure_not_zero((right-left)/2);
+        } else {
+          KH_DBG_STEP(log_debug("        KH: (%ld) (expand) <= rows: %ld, rows_per_chunk: %ld, range: %ld - %ld", info.index_column, rows, info.rows_per_chunk, from, right);)
+          auto left_tmp = right;
+          right = right + (right-left) / 2;
+          left = left_tmp;
+        }
       }
     }
 #endif
     *rows_cnt = rows;
-    KH_DBG_STEP(log_debug("    KH: adaptive_step() returning %ld rows (left: %ld, right: %ld, ret: %ld)", rows, from, right, ensure_not_zero(right - from));)
+    KH_DBG_STEP(log_debug("    KH: (%ld) adaptive_step() returning %ld rows (left: %ld, right: %ld, ret: %ld)", info.index_column, rows, from, right, ensure_not_zero(right - from));)
     return ensure_not_zero(right - from);
   }
 
@@ -1561,7 +1632,7 @@ class Dumper::Table_worker final {
              ? index_range - info.row_count
              : info.row_count - index_range) <= row_count_accuracy;
 
-    KH_DBG(log_debug("KH: nest_level: %ld, chunk_integer_column(). min: %ld, max: %ld, row_count: %ld, estimated_chunks: %ld, estimated_step: %ld, constant?: %d",
+    KH_DBG(log_debug("KH: (%ld) chunk_integer_column(). min: %ld, max: %ld, row_count: %ld, estimated_chunks: %ld, estimated_step: %ld, constant?: %d",
       info.index_column, min, max, info.row_count, estimated_chunks, estimated_step, use_constant_step);)
 
     std::string chunk_id;
@@ -1583,11 +1654,13 @@ class Dumper::Table_worker final {
              m_log_id.c_str(), info.table->task_name.c_str(),
              use_constant_step ? "constant" : "adaptive", step);
 
-    KH_DBG(log_debug("KH: nest_level: %ld, trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld, index columns cnt: %ld",
+    KH_DBG(log_debug("KH: (%ld) trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld, index columns cnt: %ld",
         info.index_column, info.index_column, info.row_count, info.rows_per_chunk, info.table->index.info->columns().size());)
 
     bool last_chunk = false;
     bool last_chunk_on_this_level=false;
+    bool gluing_to_next_chunk = false;
+    Gluer<T> gluer(info.rows_per_chunk);
 
     while (!last_chunk && !last_chunk_on_this_level) {
       if (m_dumper->m_worker_interrupt) {
@@ -1603,7 +1676,7 @@ class Dumper::Table_worker final {
 
       bool nested_chunk = false;
       size_t idx_columns_cnt = info.table->index.info->columns().size();
-      if(new_step == 1 && info.index_column < idx_columns_cnt-1) {
+      if(!use_returned_cnt && new_step == 1 && info.index_column < idx_columns_cnt-1) {
         if(rows_cnt > info.rows_per_chunk + info.accuracy) {
           // we've got too much rows. Try to chunk using next column
 
@@ -1644,10 +1717,30 @@ class Dumper::Table_worker final {
 #endif
           new_info.index_column++;
           new_info.row_count = rows_cnt; //row_count();
-          log_debug("KH: nest_level: %ld, too much rows (tried chunk by %ld), trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld, rows_cnt (from previous): %ld, new_step: %ld",
+          log_debug("KH: (%ld) too much rows (tried chunk by %ld), trying to chunk by %ld, rows to chunk: %ld, rows per chunk: %ld, rows_cnt (from previous): %ld, new_step: %ld",
              info.index_column, new_info.index_column-1, new_info.index_column, new_info.row_count, new_info.rows_per_chunk, rows_cnt, new_step);
+
+          // if we have anything in gluer accumulated before going to next level chunking - flush it
+          typename Gluer<T>::GlueResult glue_res = gluer.flush();
+          if (glue_res.begin != 0 && glue_res.end != 0 && glue_res.rows_cnt != 0) {
+            log_info("KH: (%ld) will chunk deeper. creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
+                info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
+            create_and_push_table_data_chunk_task(*info.table,
+                                                  between(info, glue_res.begin, glue_res.end), chunk_id,
+                                                  ranges_count_g++, (last_chunk));
+          }
+
           chunk_column(new_info);
           nested_chunk = true;
+        } else {
+          if(gluing_to_next_chunk) {
+            log_debug("KH: (%ld) range: %ld, but rows_cnt: %ld. No possibility to glue. Using it.", info.index_column, new_step, rows_cnt);
+            use_returned_cnt = true;
+            gluing_to_next_chunk = false;
+          } else {
+            log_debug("KH: (%ld) range: %ld, but rows_cnt: %ld. Trying to glue.", info.index_column, new_step, rows_cnt);
+            gluing_to_next_chunk = true;
+          }
         }
       }
       // ensure that there's no integer overflow
@@ -1660,26 +1753,29 @@ class Dumper::Table_worker final {
       if (!use_constant_step) {
         if(!use_returned_cnt && rows_cnt < info.rows_per_chunk) {
           if (this_chunk_end >= max) {
-            KH_DBG(log_info("KH: nest_level: %ld, End of range. Range didn't contain enough rows (%ld). No more rows in range.",  info.index_column, rows_cnt);)
+            KH_DBG(log_info("KH: (%ld) End of range. Range didn't contain enough rows (%ld). No more rows in range.",  info.index_column, rows_cnt);)
             // nothing to extend. If it is processing of the nested chunk - bail out
             if (!last_chunk) {
-              KH_DBG(log_info("KH: nest_level: %ld, This was nested chunk. Need to dump it as it is",  info.index_column);)
+              KH_DBG(log_info("KH: (%ld) This was nested chunk. Need to dump it as it is",  info.index_column);)
               last_chunk_on_this_level = true;
             }
           } else {
-            KH_DBG(log_info("KH: nest_level: %ld, range didn't contain enough rows (%ld). Extending range.",  info.index_column, rows_cnt);)
+            KH_DBG(log_info("KH: (%ld) range didn't contain enough rows (%ld). Extending range.",  info.index_column, rows_cnt);)
             step += step;
             continue;
           }
         }
       } else {
-        KH_DBG(log_info("KH: nest_level: %ld, constant step chunk", info.index_column);)
+        KH_DBG(log_info("KH: (%ld) constant step chunk", info.index_column);)
       }
 
+      // go back to the original step
+      step = estimated_step;
+
       if (this_chunk_end >= max) {
-        KH_DBG(log_info("KH: nest_level: %ld, End of range. rows (%ld). No more rows in range.",  info.index_column, rows_cnt);)
+        KH_DBG(log_info("KH: (%ld) End of range. rows (%ld). No more rows in range.",  info.index_column, rows_cnt);)
         if (!last_chunk) {
-          KH_DBG(log_info("KH: nest_level: %ld, This was nested chunk. Need to dump it as it is",  info.index_column);)
+          KH_DBG(log_info("KH: (%ld) This was nested chunk. Need to dump it as it is",  info.index_column);)
           last_chunk_on_this_level = true;
         }
       }
@@ -1690,12 +1786,14 @@ class Dumper::Table_worker final {
         continue;
       }
 
-      log_info("KH: nest_level: %ld, creating dump task for chunk: %s, rows_cnt: %ld (rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld",
-         info.index_column , chunk_id.c_str(), rows_cnt, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column);
-
-      create_and_push_table_data_chunk_task(*info.table,
-                                            between(info, begin, end), chunk_id,
-                                            ranges_count_g++, (last_chunk));
+      typename Gluer<T>::GlueResult glue_res = gluer.glue(begin, end, use_constant_step?info.rows_per_chunk:rows_cnt, last_chunk_on_this_level || last_chunk);
+      if (glue_res.begin != 0 && glue_res.end != 0 && glue_res.rows_cnt != 0) {
+        log_info("KH: (%ld) creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
+            info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
+        create_and_push_table_data_chunk_task(*info.table,
+                                              between(info, glue_res.begin, glue_res.end), chunk_id,
+                                              ranges_count_g++, (last_chunk));
+      }
     }
 
     return ranges_count_g;
@@ -1807,7 +1905,8 @@ class Dumper::Table_worker final {
         "SELECT SQL_NO_CACHE " + info.table->index.info->columns_sql() +
         " FROM " + info.table->quoted_name + info.partition + where(info.where);
 #endif
-    auto result = query(sql + info.order_by + " LIMIT 1");
+    auto result = query(sql + info.order_by + " LIMIT 1", true);
+    //log_debug("KH: after query");
     auto row = result->fetch_one();
 
     const auto handle_empty_table = [&info, this]() {
@@ -1823,7 +1922,8 @@ class Dumper::Table_worker final {
 
     const Row begin = fetch_row(row);
 
-    result = query(sql + info.order_by_desc + " LIMIT 1");
+    result = query(sql + info.order_by_desc + " LIMIT 1", true);
+    //log_debug("KH: after query");
     row = result->fetch_one();
 
     if (!row) {
