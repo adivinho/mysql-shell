@@ -1342,8 +1342,9 @@ class Gluer {
       T end;
       uint64_t rows_cnt;
       bool empty;
+      bool flushed;
 
-      GlueResult(T b, T e, uint64_t r, bool em) : begin(b), end(e), rows_cnt(r), empty(em) {}
+      GlueResult(T b, T e, uint64_t r, bool em, bool f) : begin(b), end(e), rows_cnt(r), empty(em), flushed(f){}
     };
 
     Gluer(uint64_t max_rows_cnt)
@@ -1351,7 +1352,7 @@ class Gluer {
       , end_(0)
       , rows_cnt_(0)
       , max_rows_cnt_(max_rows_cnt)
-      , zero_result(0, 0, 0, true)
+      , zero_result(0, 0, 0, true, false)
       , empty_(true) {}
 
     ~Gluer() {
@@ -1362,7 +1363,7 @@ class Gluer {
 
     GlueResult flush() {
         KH_DBG_GLUE(log_debug("KH: flush() (%ld - %ld) rows: %ld, empty?: %d", begin_, end_, rows_cnt_, empty_);)
-        GlueResult res(begin_, end_, rows_cnt_, empty_);
+        GlueResult res(begin_, end_, rows_cnt_, empty_, true);
         begin_ = end_ = 0;
         rows_cnt_ = 0;
         empty_ = true;
@@ -1385,13 +1386,13 @@ class Gluer {
         }
         // we have some rows accumulated
         // if this is the last chunk, we need to glue. Flush will be triggered later in this function
-        if (rows_cnt_ > max_rows_cnt_ && ! last) {
+        if (rows_cnt_ > max_rows_cnt_ /*&& ! last*/) {
           // we are ready to flush, just wait for good conditions
           if (rows_cnt > max_rows_cnt_/2) {
             // if the upcoming chunk is a good candidate to start new glue,
             // return the current glue and remember this chunk
             KH_DBG_GLUE(log_debug("KH: glue() - return current, start new");)
-            GlueResult res(begin_, end_, rows_cnt_, empty_);
+            GlueResult res(begin_, end_, rows_cnt_, empty_, false);
             begin_ = begin;
             end_ = end;
             rows_cnt_ = rows_cnt;
@@ -1833,12 +1834,45 @@ class Gluer {
       }
 
       typename Gluer<T>::GlueResult glue_res = gluer.glue(begin, end, rows_cnt, last_chunk_on_this_level || last_chunk);
-      if (!glue_res.empty || last_chunk) {  // create last chunk even if it is empty
+      if (!glue_res.empty) {
+        if (last_chunk && glue_res.flushed) {
+          log_info("KH: (%ld), this is the last chunk in the dump. Was flushed during last glue.", info.index_column);
+        }
+        if (last_chunk_on_this_level && !last_chunk && glue_res.flushed) {
+          log_info("KH: (%ld), this is the last chunk on this nested level. Was flushed during last glue.", info.index_column);
+        }
         log_info("KH: (%ld) creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
             info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
         create_and_push_table_data_chunk_task(*info.table,
                                               between(info, glue_res.begin, glue_res.end), chunk_id,
-                                              ranges_count_g++, (last_chunk));
+                                              ranges_count_g++, (last_chunk && glue_res.flushed));
+      }
+      // Gluer was not flushed during last glue, and this is the last chunk on this level or on top level
+      if (!glue_res.flushed && (last_chunk_on_this_level || last_chunk)) {
+        chunk_id = std::to_string(ranges_count_g);
+        glue_res = gluer.flush();
+
+        if (last_chunk) {
+          // top level. Create even an empty last chunk
+          log_info("KH: (%ld) this is the last chunk in the dump. Needed additional flush after last glue.",
+              info.index_column);
+          log_info("KH: (%ld) creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
+              info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
+          create_and_push_table_data_chunk_task(*info.table,
+                                                between(info, glue_res.begin, glue_res.end), chunk_id,
+                                                ranges_count_g++, true);
+        } else {
+          // nested level. If there is something to dump, do it
+          if (!glue_res.empty) {
+            log_info("KH: (%ld) this is the last chunk on this nested level. Needed additional flush after last glue.",
+                info.index_column);
+            log_info("KH: (%ld) creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
+                info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
+            create_and_push_table_data_chunk_task(*info.table,
+                                                  between(info, glue_res.begin, glue_res.end), chunk_id,
+                                                  ranges_count_g++, false);
+          }
+        }
       }
     }
 
