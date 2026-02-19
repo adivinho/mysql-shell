@@ -1188,8 +1188,10 @@ class Dumper::Table_worker final {
   }
 
   template <typename T>
-  static T constant_step(const T & /* from */, const T &step, uint64_t *, bool) {
-    return step;
+  static T constant_step(const T &, const T &step_hint, const T &/*max*/,
+                  const Chunking_info &info, const std::string &, uint64_t *rows_cnt, bool *) {
+    *rows_cnt = info.rows_per_chunk;
+    return step_hint;
   }
 
   template <typename T>
@@ -1306,6 +1308,7 @@ class Dumper::Table_worker final {
 #define KH_DBG(x) x
 #define KH_DBG_GLUE(x) x
 
+#if 0
 template <class T>
 class Gluer {
   public:
@@ -1317,39 +1320,78 @@ class Gluer {
       GlueResult(T b, T e, uint64_t r) : begin(b), end(e), rows_cnt(r) {}
     };
 
+    Gluer(uint64_t) {}
+
+    GlueResult flush() {
+        GlueResult res(0, 0, 0);
+        return res;
+    }
+
+    GlueResult glue(T begin, T end,  uint64_t rows_cnt, bool) {
+      GlueResult res(begin, end, rows_cnt);
+      return res;
+    }
+};
+
+#else
+template <class T>
+class Gluer {
+  public:
+    struct GlueResult {
+      T begin;
+      T end;
+      uint64_t rows_cnt;
+      bool empty;
+
+      GlueResult(T b, T e, uint64_t r, bool em) : begin(b), end(e), rows_cnt(r), empty(em) {}
+    };
+
     Gluer(uint64_t max_rows_cnt)
       : begin_(0)
       , end_(0)
       , rows_cnt_(0)
       , max_rows_cnt_(max_rows_cnt)
-      , zero_result(0, 0, 0) {}
+      , zero_result(0, 0, 0, true)
+      , empty_(true) {}
+
+    ~Gluer() {
+      if (!empty_ || rows_cnt_ > 0 || begin_ > 0 || end_ > 0) {
+        KH_DBG_GLUE(log_debug("KH: ~Gluer() destroying nonepty Gluer! (%ld - %ld) rows: %ld, empty?: %d", begin_, end_, rows_cnt_, empty_);)
+      }
+    }
 
     GlueResult flush() {
-        KH_DBG_GLUE(log_debug("KH: flush() (%ld - %ld) rows: %ld", begin_, end_, rows_cnt_);)
-        GlueResult res(begin_, end_, rows_cnt_);
+        KH_DBG_GLUE(log_debug("KH: flush() (%ld - %ld) rows: %ld, empty?: %d", begin_, end_, rows_cnt_, empty_);)
+        GlueResult res(begin_, end_, rows_cnt_, empty_);
         begin_ = end_ = 0;
         rows_cnt_ = 0;
+        empty_ = true;
         return res;
     }
 
     GlueResult glue(T begin, T end,  uint64_t rows_cnt, bool last) {
       KH_DBG_GLUE(log_debug("KH: glue() %ld - %ld, rows: %ld, last?: %d (current: %ld - %ld, %ld)",
         begin, end, rows_cnt, last, begin_, end_, rows_cnt_);)
-      if (rows_cnt_ == 0) {
+      if (empty_) {
         // whatever is the chunk, wait for the next one to decide
         KH_DBG_GLUE(log_debug("KH: glue() - new glue");)
         begin_ = begin;
         end_ = end;
         rows_cnt_ += rows_cnt;
+        empty_ = false;
       } else {
+        if (begin != end_+1) {
+          KH_DBG_GLUE(log_debug("KH: glue inconsistency detected! end_: %ld, begin: %ld", end_, begin);)
+        }
         // we have some rows accumulated
-        if (rows_cnt_ > max_rows_cnt_) {
+        // if this is the last chunk, we need to glue. Flush will be triggered later in this function
+        if (rows_cnt_ > max_rows_cnt_ && ! last) {
           // we are ready to flush, just wait for good conditions
           if (rows_cnt > max_rows_cnt_/2) {
             // if the upcoming chunk is a good candidate to start new glue,
             // return the current glue and remember this chunk
             KH_DBG_GLUE(log_debug("KH: glue() - return current, start new");)
-            GlueResult res(begin_, end_, rows_cnt_);
+            GlueResult res(begin_, end_, rows_cnt_, empty_);
             begin_ = begin;
             end_ = end;
             rows_cnt_ = rows_cnt;
@@ -1379,10 +1421,7 @@ class Gluer {
       if (last){
         // flush last chunk
         KH_DBG_GLUE(log_debug("KH: glue() - flushing gluer 2. rows: %ld, last?: %d", rows_cnt_, last);)
-        GlueResult res(begin_, end_, rows_cnt_);
-        begin_ = end_ = 0;
-        rows_cnt_ = 0;
-        return res;
+        return flush();
       }
 
       // accumulated
@@ -1396,7 +1435,9 @@ class Gluer {
     uint64_t rows_cnt_;
     uint64_t max_rows_cnt_;
     GlueResult zero_result;
+    bool empty_;
 };
+#endif
 
   template <typename T>
   T adaptive_step(const T &from, const T &step_hint, const T &/*max*/,
@@ -1636,16 +1677,21 @@ class Gluer {
       info.index_column, min, max, info.row_count, estimated_chunks, estimated_step, use_constant_step);)
 
     std::string chunk_id;
-    const auto next_step =
+    using Fn = std::function<T(
+        const T&, const T&, uint64_t*, bool*
+    )>;
+    const Fn next_step =
         use_constant_step
-            ? std::function<step_t(const step_t &, const step_t &, uint64_t *, bool*)>(
-                  constant_step<T>)
+            ? Fn{[&info, &max, &chunk_id, this](const auto &from,
+                                             const auto &step, uint64_t *rows_cnt, bool *use_returned_cnt) {
+                return this->constant_step(from, step, max, info, chunk_id, rows_cnt, use_returned_cnt);
+              }}
             // using the default capture [&] below results in problems with
             // GCC 5.4.0 (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80543)
-            : [&info, &max, &chunk_id, this](const auto &from,
+            : Fn{[&info, &max, &chunk_id, this](const auto &from,
                                              const auto &step, uint64_t *rows_cnt, bool *use_returned_cnt) {
                 return this->adaptive_step(from, step, max, info, chunk_id, rows_cnt, use_returned_cnt);
-              };
+              }};
 
     auto current = min;
     auto step = estimated_step;
@@ -1722,7 +1768,7 @@ class Gluer {
 
           // if we have anything in gluer accumulated before going to next level chunking - flush it
           typename Gluer<T>::GlueResult glue_res = gluer.flush();
-          if (glue_res.begin != 0 && glue_res.end != 0 && glue_res.rows_cnt != 0) {
+          if (!glue_res.empty /*&& glue_res.rows_cnt != 0*/) {
             log_info("KH: (%ld) will chunk deeper. creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
                 info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
             create_and_push_table_data_chunk_task(*info.table,
@@ -1781,13 +1827,13 @@ class Gluer {
       }
       current = this_chunk_end;
       ++current;
-      if (nested_chunk) {
+      if (nested_chunk && !last_chunk) {
         //log_info("KH: step processed by nested chunking. moving to the next chunk");
         continue;
       }
 
-      typename Gluer<T>::GlueResult glue_res = gluer.glue(begin, end, use_constant_step?info.rows_per_chunk:rows_cnt, last_chunk_on_this_level || last_chunk);
-      if (glue_res.begin != 0 && glue_res.end != 0 && glue_res.rows_cnt != 0) {
+      typename Gluer<T>::GlueResult glue_res = gluer.glue(begin, end, rows_cnt, last_chunk_on_this_level || last_chunk);
+      if (!glue_res.empty || last_chunk) {  // create last chunk even if it is empty
         log_info("KH: (%ld) creating dump task for chunk: %s, rows_cnt: %ld (r: %2f, rpc: %ld, acc: %ld), new_step: %ld, last?: %d, idx_column: %ld, cond: %s",
             info.index_column , chunk_id.c_str(), glue_res.rows_cnt, (double)glue_res.rows_cnt/(double)info.rows_per_chunk, info.rows_per_chunk, info.accuracy, new_step+1, last_chunk, info.index_column, between(info, glue_res.begin, glue_res.end).c_str());
         create_and_push_table_data_chunk_task(*info.table,
