@@ -1696,7 +1696,8 @@ class Dumper::Table_worker final {
           rows_cnt_ += rows_cnt;
         }
 
-        if (rows_cnt_ > 3 * max_rows_cnt_ || last) {
+        static constexpr uint64_t flush_threshold_multiplier = 3;
+        if (rows_cnt_ > flush_threshold_multiplier * max_rows_cnt_ || last) {
           // flush gluer if we accumulated a lot of chunks or this is the last
           // one
           DBG_GLUE(log_debug("Gluer::glue() - Gluer full. rows: %ld, last?: %d",
@@ -2103,15 +2104,28 @@ class Dumper::Table_worker final {
 
       last_chunk_in_dump = last_chunk_on_this_level && info.index_column == 0;
 
-      // If the current chunk was processed by deep chunking, we have nothing to
-      // dump. Just go to the next chunk on this level.
+      // If the current chunk was processed by nested chunking, we have
+      // nothing to dump. Just go to the next chunk on this level.
       // In other case, we need to glue.
       auto current_chunk_begin_for_glue = current_chunk_begin;
 
       current_chunk_begin = current_chunk_end;
       ++current_chunk_begin;
-      if (processed_by_deep_chunking && !last_chunk_in_dump) {
-        continue;
+      if (processed_by_deep_chunking) {
+        if (!last_chunk_in_dump) continue;
+
+        // This is the last chunk in the dump and it was processed by nested
+        // chunking. Nothing else to dump. We need to create an empty chunk
+        // to mark the end of dump.
+        DBG(log_debug("Nest level: %ld, this is the last chunk in the dump. It "
+                      "was processed by nested chunking. Creating an empty "
+                      "chunk to mark the end of dump.",
+                      info.index_column);)
+        // The following condition will evaluate to 'false' always, causing
+        // the empty chunk to be created.
+        const_cast<Chunking_info &>(info).boundary = "1=0";
+        chunk_id = std::to_string(info.ranges_counter);
+        rows_cnt = 0;
       }
 
       // Put the chunk through gluer logic
@@ -2126,22 +2140,24 @@ class Dumper::Table_worker final {
                   "flushed "
                   "during last glue.",
                   info.index_column);
-            } if (last_chunk_on_this_level && !last_chunk_in_dump &&
+            }
+            if (last_chunk_on_this_level && !last_chunk_in_dump &&
                   glue_res.flushed) {
               log_debug(
                   "Nest level: %ld, this is the last chunk on this nested "
                   "level. Was "
                   "flushed during last glue.",
                   info.index_column);
-            } log_info("Nest level: %ld) creating dump task for chunk: %s, "
-                       "rows_cnt: "
-                       "%ld (r: %2f, rpc: %ld, acc: %ld), new_step: %s, last?: "
-                       "%d, idx_column: %ld, cond: %s",
-                       info.index_column, chunk_id.c_str(), glue_res.rows_cnt,
-                       (double)glue_res.rows_cnt / (double)info.rows_per_chunk,
-                       info.rows_per_chunk, info.accuracy, V2S(new_step + 1),
-                       last_chunk_in_dump, info.index_column,
-                       between(info, glue_res.begin, glue_res.end).c_str());)
+            }
+            log_info("Nest level: %ld) creating dump task for chunk: %s, "
+                  "rows_cnt: "
+                  "%ld (r: %2f, rpc: %ld, acc: %ld), new_step: %s, last?: "
+                  "%d, idx_column: %ld, cond: %s",
+                  info.index_column, chunk_id.c_str(), glue_res.rows_cnt,
+                  (double)glue_res.rows_cnt / (double)info.rows_per_chunk,
+                  info.rows_per_chunk, info.accuracy, V2S(new_step + 1),
+                  last_chunk_in_dump, info.index_column,
+                  between(info, glue_res.begin, glue_res.end).c_str());)
         create_and_push_table_data_chunk_task(
             *info.table, between(info, glue_res.begin, glue_res.end), chunk_id,
             info.ranges_counter++, (last_chunk_in_dump && glue_res.flushed));
@@ -2548,11 +2564,30 @@ class Dumper::Table_worker final {
           "Failed to parse JSON output of an EXPLAIN statement: %s", e.what()));
     }
 
+    // This function is fragile, as originally it expects info about rows
+    // count to be in a specific place in the JSON output of EXPLAIN statement.
+    // Moreover it expects it to be a number. However, in some cases
+    // (e.g. when there are no rows to process) the output may differ between
+    // MySQL versions.
+    // That's why I think it should return 0 when it is not able to find the row
+    // count in the expected place.
     if (auto *v = rapidjson::Pointer("/query_block/message").Get(json)) {
       if (v->IsString()) {
         std::string msg = v->GetString();
         if (msg.find("no matching row") != std::string::npos ||
             msg.find("no rows") != std::string::npos) {
+          log_info(
+              "EXPLAIN statement returned message indicating that there are no "
+              "rows to process: %s",
+              msg.c_str());
+          return 0;
+        }
+      }
+    }
+    if (auto *v = rapidjson::Pointer("/query_plan/access_type").Get(json)) {
+      if (v->IsString()) {
+        std::string msg = v->GetString();
+        if (msg.find("zero_rows_aggregated") != std::string::npos) {
           log_info(
               "EXPLAIN statement returned message indicating that there are no "
               "rows to process: %s",
@@ -2967,17 +3002,20 @@ void Dumper::do_run() {
         current_console()->print_status(msg);
       }
 
-      std::string strategy = (m_options.adaptive_step_strategy() ==
-                              mysqlsh::dump::AdaptiveStepStrategy::ENHANCED)
-                                 ? "enhanced"
-                                 : "original";
-      msg = "Using " + strategy + " adaptive step strategy.";
-      current_console()->print_status(msg);
-      msg = "Maximum chunking nesting depth: " +
-            (m_options.max_key_prefix_length() == 0
-                 ? "unlimited"
-                 : std::to_string(m_options.max_key_prefix_length()));
-      current_console()->print_status(msg);
+      // print chunking strategy information only if chunking is enabled
+      if (m_options.split()) {
+        std::string strategy = (m_options.adaptive_step_strategy() ==
+                                mysqlsh::dump::AdaptiveStepStrategy::ENHANCED)
+                                   ? "enhanced"
+                                   : "original";
+        msg = "Using " + strategy + " adaptive step strategy.";
+        current_console()->print_status(msg);
+        msg = "Maximum chunking nesting depth: " +
+              (m_options.max_key_prefix_length() == 0
+                   ? "unlimited"
+                   : std::to_string(m_options.max_key_prefix_length()));
+        current_console()->print_status(msg);
+      }
 
       if (!m_options.is_dry_run() && m_options.show_progress() &&
           m_options.dump_data()) {
